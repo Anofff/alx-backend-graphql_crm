@@ -11,21 +11,33 @@ class CustomerType(DjangoObjectType):
     class Meta:
         model = Customer
         fields = "__all__"
+        interfaces = (graphene.Node,)
 
 
 class ProductType(DjangoObjectType):
     class Meta:
         model = Product
         fields = "__all__"
+        interfaces = (graphene.Node,)
 
 
 class OrderType(DjangoObjectType):
     class Meta:
         model = Order
         fields = "__all__"
+        interfaces = (graphene.Node,)
 
 
 class Query(graphene.ObjectType):
+    # DjangoFilterConnectionField queries for advanced filtering
+    all_customers = DjangoFilterConnectionField(
+        CustomerType, filterset_class=CustomerFilter
+    )
+    all_products = DjangoFilterConnectionField(
+        ProductType, filterset_class=ProductFilter
+    )
+    all_orders = DjangoFilterConnectionField(OrderType, filterset_class=OrderFilter)
+
     # Simple list queries with filtering and sorting
     customers = graphene.List(
         CustomerType,
