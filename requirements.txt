@@ -10,3 +10,6 @@ sqlparse==0.5.3
 text-unidecode==1.3
 typing-extensions==4.15.0
 tzdata==2025.2
+gql==3.5.0
+requests==2.32.3
+django-crontab==0.7.1

@@ -357,6 +357,42 @@ class DeleteOrder(graphene.Mutation):
             return DeleteOrder(success=False, errors=[str(e)])
 
 
+class UpdateLowStockProducts(graphene.Mutation):
+    """Mutation to update low-stock products (stock < 10) by incrementing stock by 10."""
+
+    success = graphene.Boolean()
+    message = graphene.String()
+    updated_products = graphene.List(ProductType)
+
+    def mutate(self, info):
+        try:
+            with transaction.atomic():
+                # Find products with stock < 10
+                low_stock_products = Product.objects.filter(stock__lt=10)
+
+                # Increment stock by 10 for each product
+                updated_products_list = []
+                for product in low_stock_products:
+                    product.stock += 10
+                    product.save()
+                    updated_products_list.append(product)
+
+                message = (
+                    f"Updated {len(updated_products_list)} product(s) with low stock."
+                )
+                return UpdateLowStockProducts(
+                    success=True,
+                    message=message,
+                    updated_products=updated_products_list,
+                )
+        except Exception as e:
+            return UpdateLowStockProducts(
+                success=False,
+                message=f"Error updating low stock products: {str(e)}",
+                updated_products=[],
+            )
+
+
 class Mutation(graphene.ObjectType):
     create_customer = CreateCustomer.Field()
     bulk_create_customers = BulkCreateCustomers.Field()
@@ -367,3 +403,4 @@ class Mutation(graphene.ObjectType):
     delete_customer = DeleteCustomer.Field()
     delete_product = DeleteProduct.Field()
     delete_order = DeleteOrder.Field()
+    update_low_stock_products = UpdateLowStockProducts.Field()
