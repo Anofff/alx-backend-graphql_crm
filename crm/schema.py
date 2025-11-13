@@ -2,10 +2,65 @@ import graphene
 from graphene_django import DjangoObjectType
 from graphene_django.filter import DjangoFilterConnectionField
 from django.db import transaction
-from decimal import Decimal
+import re
 from crm.models import Customer, Product, Order
-from crm.models import Product
 from .filters import CustomerFilter, ProductFilter, OrderFilter
+
+
+class OrderedDjangoFilterConnectionField(DjangoFilterConnectionField):
+    """Custom connection field that supports order_by parameter"""
+
+    def __init__(self, *args, **kwargs):
+        # Store order_by argument definition but don't pass to parent
+        self._order_by_arg = kwargs.pop("order_by", graphene.String())
+        super().__init__(*args, **kwargs)
+
+    @classmethod
+    def connection_resolver(
+        cls,
+        resolver,
+        connection,
+        default_manager,
+        max_limit,
+        enforce_first_or_last,
+        filterset_class,
+        filterset_kwargs,
+        *args,
+        **kwargs,
+    ):
+        # Extract order_by before calling parent
+        order_by = kwargs.pop("order_by", None)
+
+        # Modify filterset_kwargs to apply ordering after filtering
+        original_filterset_kwargs = filterset_kwargs.copy() if filterset_kwargs else {}
+
+        # Create a custom filterset that applies ordering
+        if order_by and filterset_class:
+            # Capture order_by in closure
+            order_by_value = order_by
+
+            class OrderedFilterSet(filterset_class):
+                @property
+                def qs(self):
+                    qs = super().qs
+                    if order_by_value:
+                        qs = qs.order_by(order_by_value)
+                    return qs
+
+            filterset_class = OrderedFilterSet
+
+        # Call parent with modified filterset
+        return super().connection_resolver(
+            resolver,
+            connection,
+            default_manager,
+            max_limit,
+            enforce_first_or_last,
+            filterset_class,
+            original_filterset_kwargs,
+            *args,
+            **kwargs,
+        )
 
 
 class CustomerType(DjangoObjectType):
@@ -30,14 +85,28 @@ class OrderType(DjangoObjectType):
 
 
 class Query(graphene.ObjectType):
-    # DjangoFilterConnectionField queries for advanced filtering
-    all_customers = DjangoFilterConnectionField(
-        CustomerType, filterset_class=CustomerFilter
+    # DjangoFilterConnectionField queries for advanced filtering with order_by support
+    all_customers = OrderedDjangoFilterConnectionField(
+        CustomerType, filterset_class=CustomerFilter, order_by=graphene.String()
     )
-    all_products = DjangoFilterConnectionField(
-        ProductType, filterset_class=ProductFilter
+    all_products = OrderedDjangoFilterConnectionField(
+        ProductType, filterset_class=ProductFilter, order_by=graphene.String()
     )
-    all_orders = DjangoFilterConnectionField(OrderType, filterset_class=OrderFilter)
+    all_orders = OrderedDjangoFilterConnectionField(
+        OrderType, filterset_class=OrderFilter, order_by=graphene.String()
+    )
+
+    def resolve_all_customers(self, info, **kwargs):
+        # Return base queryset - ordering will be applied by the custom field
+        return Customer.objects.all()
+
+    def resolve_all_products(self, info, **kwargs):
+        return Product.objects.all()
+
+    def resolve_all_orders(self, info, **kwargs):
+        return (
+            Order.objects.select_related("customer").prefetch_related("products").all()
+        )
 
     # Simple list queries with filtering and sorting
     customers = graphene.List(
@@ -157,43 +226,109 @@ class CreateCustomer(graphene.Mutation):
         input = CustomerInput(required=True)
 
     customer = graphene.Field(CustomerType)
+    message = graphene.String()
     success = graphene.Boolean()
     errors = graphene.List(graphene.String)
 
+    def validate_phone(self, phone):
+        """Validate phone format: +1234567890 or 123-456-7890"""
+        if not phone:
+            return True
+        # Pattern: + followed by digits, or digits with dashes
+        pattern = r"^(\+\d{10,15}|\d{3}-\d{3}-\d{4})$"
+        return bool(re.match(pattern, phone))
+
     def mutate(self, info, input):
+        errors = []
+
+        # Validate email uniqueness
+        if Customer.objects.filter(email=input.email).exists():
+            errors.append("Email already exists")
+            return CreateCustomer(
+                customer=None,
+                message="Failed to create customer",
+                success=False,
+                errors=errors,
+            )
+
+        # Validate phone format
+        if input.phone and not self.validate_phone(input.phone):
+            errors.append("Invalid phone format. Use +1234567890 or 123-456-7890")
+            return CreateCustomer(
+                customer=None,
+                message="Failed to create customer",
+                success=False,
+                errors=errors,
+            )
+
         try:
             customer = Customer.objects.create(
-                name=input.name, email=input.email, phone=input.phone
+                name=input.name, email=input.email, phone=input.phone or ""
             )
-            return CreateCustomer(customer=customer, success=True, errors=[])
+            return CreateCustomer(
+                customer=customer,
+                message="Customer created successfully",
+                success=True,
+                errors=[],
+            )
         except Exception as e:
-            return CreateCustomer(customer=None, success=False, errors=[str(e)])
+            return CreateCustomer(
+                customer=None,
+                message="Failed to create customer",
+                success=False,
+                errors=[str(e)],
+            )
 
 
 class BulkCreateCustomers(graphene.Mutation):
     class Arguments:
-        inputs = graphene.List(CustomerInput, required=True)
+        input = graphene.List(CustomerInput, required=True)
 
     customers = graphene.List(CustomerType)
-    success = graphene.Boolean()
     errors = graphene.List(graphene.String)
 
-    def mutate(self, info, inputs):
+    def validate_phone(self, phone):
+        """Validate phone format: +1234567890 or 123-456-7890"""
+        if not phone:
+            return True
+        pattern = r"^(\+\d{10,15}|\d{3}-\d{3}-\d{4})$"
+        return bool(re.match(pattern, phone))
+
+    def mutate(self, info, input):
         customers = []
         errors = []
 
-        try:
-            with transaction.atomic():
-                for input_data in inputs:
+        # Process each customer individually to support partial success
+        for idx, input_data in enumerate(input):
+            customer_errors = []
+
+            # Validate email uniqueness
+            if Customer.objects.filter(email=input_data.email).exists():
+                customer_errors.append(
+                    f"Row {idx + 1}: Email '{input_data.email}' already exists"
+                )
+
+            # Validate phone format
+            if input_data.phone and not self.validate_phone(input_data.phone):
+                customer_errors.append(
+                    f"Row {idx + 1}: Invalid phone format. Use +1234567890 or 123-456-7890"
+                )
+
+            # If no validation errors, try to create the customer
+            if not customer_errors:
+                try:
                     customer = Customer.objects.create(
                         name=input_data.name,
                         email=input_data.email,
-                        phone=input_data.phone,
+                        phone=input_data.phone or "",
                     )
                     customers.append(customer)
-            return BulkCreateCustomers(customers=customers, success=True, errors=[])
-        except Exception as e:
-            return BulkCreateCustomers(customers=[], success=False, errors=[str(e)])
+                except Exception as e:
+                    errors.append(f"Row {idx + 1}: {str(e)}")
+            else:
+                errors.extend(customer_errors)
+
+        return BulkCreateCustomers(customers=customers, errors=errors)
 
 
 class CreateProduct(graphene.Mutation):
@@ -205,9 +340,22 @@ class CreateProduct(graphene.Mutation):
     errors = graphene.List(graphene.String)
 
     def mutate(self, info, input):
+        errors = []
+
+        # Validate price is positive
+        if input.price <= 0:
+            errors.append("Price must be positive")
+            return CreateProduct(product=None, success=False, errors=errors)
+
+        # Validate stock is non-negative
+        stock_value = input.stock if input.stock is not None else 0
+        if stock_value < 0:
+            errors.append("Stock must be non-negative")
+            return CreateProduct(product=None, success=False, errors=errors)
+
         try:
             product = Product.objects.create(
-                name=input.name, price=input.price, stock=input.stock
+                name=input.name, price=input.price, stock=stock_value
             )
             return CreateProduct(product=product, success=True, errors=[])
         except Exception as e:
@@ -223,22 +371,38 @@ class CreateOrder(graphene.Mutation):
     errors = graphene.List(graphene.String)
 
     def mutate(self, info, input):
+        errors = []
+
+        # Validate at least one product is provided
+        if not input.product_ids or len(input.product_ids) == 0:
+            errors.append("At least one product must be selected")
+            return CreateOrder(order=None, success=False, errors=errors)
+
         try:
             with transaction.atomic():
                 # Get customer
                 try:
                     customer = Customer.objects.get(pk=input.customer_id)
                 except Customer.DoesNotExist:
-                    return CreateOrder(
-                        order=None, success=False, errors=["Customer not found"]
-                    )
+                    errors.append(f"Invalid customer ID: {input.customer_id}")
+                    return CreateOrder(order=None, success=False, errors=errors)
 
                 # Get products
                 products = Product.objects.filter(pk__in=input.product_ids)
-                if not products.exists():
-                    return CreateOrder(
-                        order=None, success=False, errors=["No valid products found"]
+                found_product_ids = set(products.values_list("id", flat=True))
+                requested_product_ids = set(input.product_ids)
+
+                # Check if all requested products exist
+                missing_ids = requested_product_ids - found_product_ids
+                if missing_ids:
+                    errors.append(
+                        f"Invalid product ID(s): {', '.join(map(str, missing_ids))}"
                     )
+                    return CreateOrder(order=None, success=False, errors=errors)
+
+                if not products.exists():
+                    errors.append("No valid products found")
+                    return CreateOrder(order=None, success=False, errors=errors)
 
                 # Calculate total amount
                 total_amount = sum(product.price for product in products)
